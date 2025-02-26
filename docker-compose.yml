@@ -1,0 +1,16 @@
+services:
+  sign-speak-app:
+    container_name: sign-speak
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - PYTHON_VERSION=3.10.7
+    volumes:
+      - .:/app
+    devices:
+      - "/dev/video0:/dev/video0"  # Accès à la caméra
+    environment:
+      - DISPLAY=$DISPLAY
+    stdin_open: true
+    tty: true
