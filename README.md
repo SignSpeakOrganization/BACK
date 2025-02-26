@@ -10,7 +10,7 @@ se placer dans l'environnement : <br>
 ```venv\Scripts\activate```
 
 installation :<br>
-```pip install mediapip``` <br>
+```pip install mediapipe``` <br>
 ```pip install opencv-python```<br>
 ```pip install tensorflow``` <br>
 ```pip install tf-nightly``` <br>
