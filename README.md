@@ -17,6 +17,10 @@ installation :<br>
 ```pip install scikit-learn``` <br>
 ```pip install matplotlib``` <br>
 
+installation de Flask :<br>
+```pip install flask``` <br>
+```pip install flask-cors```<br>
+
 lancer le projet : <br>
 ```python app.py``` 
 
