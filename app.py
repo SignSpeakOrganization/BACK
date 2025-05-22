@@ -15,10 +15,12 @@ from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
 
-from flask import Flask, jsonify
+from flask import Flask, Response, jsonify
+from flask_cors import CORS
 from threading import Thread
 
 cap = None
+hand_sign_letter = None
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -46,6 +48,7 @@ def main():
     print("Lancement du main()")
     # Argument parsing #################################################################
     global cap
+    global hand_sign_letter
 
     args = get_args()
 
@@ -165,6 +168,9 @@ def main():
                 most_common_fg_id = Counter(
                     finger_gesture_history).most_common()
 
+                hand_sign_letter = keypoint_classifier_labels[hand_sign_id]
+                send_hand_sign_letter()
+
                 # Drawing part
                 debug_image = draw_bounding_rect(use_brect, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
@@ -186,6 +192,25 @@ def main():
 
     cap.release()
     cv.destroyAllWindows()
+
+
+def generate_frames():
+    global cap
+    while True:
+        if cap is None:
+            continue  # ou sleep un peu, tu peux gérer le cas plus proprement
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Ici, tu peux appliquer ton traitement sur frame
+        # Exemple: frame = traitement(frame)
+
+        ret, buffer = cv.imencode('.jpg', frame)
+        frame = buffer.tobytes()
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
 def arreter_camera():
     global cap
@@ -550,7 +575,14 @@ def draw_info(image, fps, mode, number):
                        cv.LINE_AA)
     return image
 
+def send_hand_sign_letter():
+    global hand_sign_letter
+
+    print(hand_sign_letter)
+
+
 app = Flask(__name__)
+CORS(app)
 process = None
 
 @app.route('/start', methods=['GET'])
@@ -562,6 +594,20 @@ def start():
         return jsonify({"status": "main() lancé"}), 200
     else:
         return jsonify({"status": "main() déjà en cours"}), 400
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/sign', methods=['GET'])
+def sign():
+    global process
+    global hand_sign_letter
+    if process is not None and process.is_alive():
+        return jsonify({"hand_sign": hand_sign_letter}), 200
+    else:
+        return jsonify({"status": "main() pas lancée"}), 400
 
 @app.route('/end', methods=['GET'])
 def end():

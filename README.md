@@ -1,7 +1,7 @@
 mise en place :
 
 se mettre dans le bon fichier :<br>
-```cd .\hand-gesture-recognition-mediapipe\```
+```cd .\BACK\```
 
 initialisé son environnement : <br>
 ```python -m venv venv```
