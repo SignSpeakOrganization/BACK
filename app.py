@@ -585,15 +585,24 @@ app = Flask(__name__)
 CORS(app)
 process = None
 
+@app.route('/health', methods=['GET'])
+def health():
+    """Endpoint de santé pour vérifier que l'API fonctionne"""
+    return jsonify({
+        "status": "ok",
+        "message": "API is running",
+        "service": "sign-speak-api"
+    }), 200
+
 @app.route('/start', methods=['GET'])
 def start():
     global process
     if process is None or not process.is_alive():
         process = Thread(target=main)
         process.start()
-        return jsonify({"status": "main() lancé"}), 200
+        return jsonify({"status": "main() lancé", "message": "Success"}), 200
     else:
-        return jsonify({"status": "main() déjà en cours"}), 400
+        return jsonify({"status": "main() déjà en cours", "message": "Error 400"}), 400
 
 @app.route('/video_feed')
 def video_feed():
@@ -614,9 +623,9 @@ def end():
     global process
     if process is not None and process.is_alive():
         arreter_camera()
-        return jsonify({"status": "main() terminé"}), 200
+        return jsonify({"status": "main() terminé", "message": "Success"}), 200
     else:
-        return jsonify({"status": "main() pas lancée"}), 400
+        return jsonify({"status": "main() pas lancée", "message": "Error 400"}), 400
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)

@@ -117,3 +117,53 @@ Attendez que toutes les opérations se terminent. Cela peut prendre quelques min
 - Devant chaque bloc de code, un `[ * ]` signifie qu'il est en cours d'exécution.  
 - Une fois terminé, `*` est remplacé par un numéro.  
 - Si une erreur survient, elle sera affichée sous le bloc concerné. 
+
+
+---
+
+# Utilisation avec Docker Compose
+
+## 1. Initialiser le projet
+
+Assurez-vous d'avoir [Docker](https://www.docker.com/) et [Docker Compose](https://docs.docker.com/compose/) installés.
+
+Pour préparer et démarrer l'environnement :
+
+```bash
+docker-compose up --build -d
+```
+
+## 2. Créer le fichier `.env` (optionnel mais recommandé)
+
+Créez un fichier `.env` à la racine du projet pour configurer les variables d'environnement :
+
+```bash
+touch .env
+echo "APP_ENV=development" >> .env
+echo "FLASK_ENV=development" >> .env
+echo "FLASK_DEBUG=1" >> .env
+```
+
+*Adaptez au besoin selon votre environnement.*
+
+## 3. Lancer Jupyter Notebook dans le conteneur
+
+Exécutez la commande suivante pour démarrer Jupyter Notebook à l'intérieur du conteneur Docker :
+
+```bash
+docker exec -it sign-speak_app jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='' --NotebookApp.password=''
+```
+
+Vous verrez une URL affichée, généralement http://127.0.0.1:8888 (accès sans mot de passe ni token).
+
+---
+
+Vous pouvez alors ouvrir Jupyter dans votre navigateur à l'adresse : http://127.0.0.1:8888
+
+**Astuce :** Pour arrêter l'environnement :
+
+```bash
+docker-compose down
+```
+
+

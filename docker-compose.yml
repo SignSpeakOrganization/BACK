@@ -1,16 +1,46 @@
 services:
-  sign-speak-app:
-    container_name: sign-speak
+  # Flask Application - Hand Gesture Recognition
+  app:
     build:
       context: .
       dockerfile: Dockerfile
       args:
         - PYTHON_VERSION=3.10.7
+    container_name: sign-speak_app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5001:5000"  # Flask API accessible via localhost (port 5001 car 5000 est utilisé par AirPlay sur macOS)
+      - "127.0.0.1:8888:8888"  # Jupyter Notebook accessible via localhost
     volumes:
+      # Mount entire project for hot reload in development
       - .:/app
-    devices:
-      - "/dev/video0:/dev/video0"  # Accès à la caméra
+      # Persistent model data (to preserve trained models)
+      - model_data:/app/model
+    # devices:
+      # Access to camera (Linux only - comment out on macOS/Windows)
+      # Uncomment on Linux systems with camera access:
+      # - "/dev/video0:/dev/video0"
     environment:
-      - DISPLAY=$DISPLAY
+      - APP_ENV=${APP_ENV:-development}
+      - FLASK_ENV=${FLASK_ENV:-development}
+      - FLASK_DEBUG=${FLASK_DEBUG:-1}
+    networks:
+      - sign-speak_network
     stdin_open: true
     tty: true
+    # Optional: For X11 display support (Linux)
+    # environment:
+    #   - DISPLAY=${DISPLAY}
+    # volumes:
+    #   - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+# Networks
+networks:
+  sign-speak_network:
+    driver: bridge
+
+# Volumes
+volumes:
+  model_data:
+    driver: local
+
