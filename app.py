@@ -22,9 +22,18 @@ from model import PointHistoryClassifier
 from flask import Flask, Response, jsonify
 from flask_cors import CORS
 from threading import Thread
+import time
+
+
 
 cap = None
 hand_sign_letter = None
+
+# === NOUVELLES VARIABLES POUR LA PHRASE ===
+current_phrase = ""          # La phrase complète en cours
+last_sign = None             # Dernier signe détecté (pour éviter les répétitions)
+last_detection_time = None   # Timestamp de la dernière fois qu'une main a été détectée
+# =========================================
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -53,6 +62,7 @@ def main():
     # Argument parsing #################################################################
     global cap
     global hand_sign_letter
+    global current_phrase, last_sign, last_detection_time
 
     args = get_args()
 
@@ -174,6 +184,24 @@ def main():
 
                 hand_sign_letter = keypoint_classifier_labels[hand_sign_id]
                 send_hand_sign_letter()
+                   
+
+                current_time = time.time()
+
+                if hand_sign_letter != last_sign:
+                    # Nouveau signe différent : on ajoute l'ancien à la phrase
+                    if last_sign is not None and last_sign != "":
+                        current_phrase += last_sign
+
+                    last_sign = hand_sign_letter
+
+                # Si pas de main détectée depuis plus de 1 seconde → espace
+                if results.multi_hand_landmarks is None:
+                    if last_detection_time is not None and (current_time - last_detection_time > 1.0):
+                        if current_phrase and current_phrase[-1] != " ":
+                            current_phrase += " "
+                else:
+                    last_detection_time = current_time
 
                 # Drawing part
                 debug_image = draw_bounding_rect(use_brect, debug_image, brect)
@@ -580,7 +608,8 @@ def draw_info(image, fps, mode, number):
     return image
 
 def send_hand_sign_letter():
-    global hand_sign_letter
+
+    global hand_sign_letter, current_phrase, last_sign, last_detection_time
 
     print(hand_sign_letter)
 
@@ -591,7 +620,7 @@ process = None
 
 @app.route('/start', methods=['GET'])
 def start():
-    global process
+    global process 
     if process is None or not process.is_alive():
         process = Thread(target=main)
         process.start()
@@ -606,13 +635,25 @@ def video_feed():
 
 @app.route('/sign', methods=['GET'])
 def sign():
-    global process
-    global hand_sign_letter
+    global process, hand_sign_letter, current_phrase
     if process is not None and process.is_alive():
-        return jsonify({"hand_sign": hand_sign_letter}), 200
+        return jsonify({
+            "hand_sign": hand_sign_letter or "",
+            "phrase": current_phrase.strip()
+        }), 200
     else:
         return jsonify({"status": "main() pas lancée"}), 400
 
+        #clear_phrase Route 
+@app.route('/clear_phrase', methods=['GET'])
+def clear_phrase():
+    global current_phrase, last_sign, last_detection_time
+    current_phrase = ""
+    last_sign = None
+    last_detection_time = None
+    return jsonify({"status": "phrase effacée"}), 200
+    
+        # end route 
 @app.route('/end', methods=['GET'])
 def end():
     global process
