@@ -10,8 +10,6 @@ import copy
 import itertools
 import csv
 from collections import deque
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
 from tensorflow.keras.models import load_model
 
 from flask import Flask, Response, jsonify
@@ -24,19 +22,32 @@ from model import KeyPointClassifier
 # --- VARIABLES GLOBALES ---
 cap = None
 debug_image = None
-final_prediction = "..."  # Le résultat unique choisi par le juge
-current_mode = "..."      # STATIQUE ou DYNAMIQUE
+final_prediction = "..."  
+current_mode = "..."      
 process = None
 
-# --- CONFIGURATION IA (MOTS DYNAMIQUES LSTM) ---
-ACTIONS = np.array(['neutre', 'bonjour']) 
-MODEL_PATH_MP = 'hand_landmarker.task'
+# --- MEDIAPIPE HOLISTIC ---
+mp_holistic = mp.solutions.holistic
+mp_drawing = mp.solutions.drawing_utils
+
+# ==========================================
+# 🧠 DÉTECTION DYNAMIQUE DES MOTS
+# ==========================================
+DATA_PATH = os.path.join('dataset')
+if os.path.exists(DATA_PATH):
+    # On liste les dossiers, et on les trie par ordre alphabétique !
+    # Le tri est crucial pour correspondre à l'ordre d'entraînement de ton Jupyter
+    ACTIONS = np.array(sorted([d for d in os.listdir(DATA_PATH) if os.path.isdir(os.path.join(DATA_PATH, d))]))
+else:
+    ACTIONS = np.array(['neutre', 'bonjour']) # Sécurité si le dossier n'existe pas
+    
+print(f"✅ Mots dynamiques détectés dans le dataset : {ACTIONS}")
 
 try:
     lstm_model = load_model('modele_lsf.keras')
-    print("Modèle LSTM (Mots) chargé avec succès !")
+    print("✅ Modèle LSTM (Mots) chargé avec succès !")
 except Exception as e:
-    print(f"Erreur chargement LSTM : {e}")
+    print(f"❌ Erreur chargement LSTM : {e}")
 
 # --- CONFIGURATION IA (LETTRES STATIQUES) ---
 keypoint_classifier = KeyPointClassifier()
@@ -44,32 +55,20 @@ keypoint_classifier = KeyPointClassifier()
 with open('model/keypoint_classifier/keypoint_classifier_label.csv', encoding='utf-8-sig') as f:
     keypoint_classifier_labels = [row[0] for row in csv.reader(f)]
 
+# ==========================================
+# 🛠️ FONCTIONS UTILITAIRES
+# ==========================================
+def extraire_points_holistic(results):
+    pose = np.array([[res.x, res.y, res.z, res.visibility] for res in results.pose_landmarks.landmark]).flatten() if results.pose_landmarks else np.zeros(132)
+    face = np.array([[res.x, res.y, res.z] for res in results.face_landmarks.landmark]).flatten() if results.face_landmarks else np.zeros(1404)
+    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(63)
+    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(63)
+    return np.concatenate([pose, face, lh, rh])
 
-# --- FONCTIONS UTILITAIRES POUR LE DESSIN ET LES LETTRES ---
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (0, 9), (9, 10), (10, 11), (11, 12),
-    (0, 13), (13, 14), (14, 15), (15, 16),
-    (0, 17), (17, 18), (18, 19), (19, 20),
-    (5, 9), (9, 13), (13, 17)
-]
-
-def draw_landmarks(image_bgr, hand_landmarks_list):
-    annotated = image_bgr.copy()
-    h, w = annotated.shape[:2]
-    for hand_landmarks in hand_landmarks_list:
-        pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
-        for a, b in HAND_CONNECTIONS:
-            cv.line(annotated, pts[a], pts[b], (0, 255, 0), 2)
-        for (x, y) in pts:
-            cv.circle(annotated, (x, y), 4, (0, 0, 255), -1)
-    return annotated
-
-def calc_landmark_list(image, hand_landmarks):
+def calc_landmark_list(image, landmarks):
     image_width, image_height = image.shape[1], image.shape[0]
     landmark_point = []
-    for _, landmark in enumerate(hand_landmarks):
+    for _, landmark in enumerate(landmarks):
         landmark_x = min(int(landmark.x * image_width), image_width - 1)
         landmark_y = min(int(landmark.y * image_height), image_height - 1)
         landmark_point.append([landmark_x, landmark_y])
@@ -89,77 +88,63 @@ def pre_process_landmark(landmark_list):
         return n / max_value if max_value > 0 else 0
     return list(map(normalize_, temp_landmark_list))
 
-
-# --- BOUCLE PRINCIPALE ---
+# ==========================================
+# 🚀 BOUCLE PRINCIPALE (IA)
+# ==========================================
 def main():
     global cap, debug_image, final_prediction, current_mode
-    print("Lancement de l'analyse avec le Juge Mathématique...")
-
-    base_options = python.BaseOptions(model_asset_path=MODEL_PATH_MP)
-    options = vision.HandLandmarkerOptions(
-        base_options=base_options,
-        num_hands=2,
-        min_hand_detection_confidence=0.5,
-        min_hand_presence_confidence=0.5,
-        running_mode=vision.RunningMode.IMAGE
-    )
+    print("Lancement de l'analyse avec le Juge Mathématique (Holistic)...")
 
     cap = cv.VideoCapture(1) # 1 pour Mac, 0 pour iPhone
     sequence_lstm = []
-    wrist_history = deque(maxlen=10) # Mémoire des 10 dernières positions du poignet
-    seuil_mouvement = 40 # En pixels (tu peux l'augmenter si c'est trop sensible)
+    wrist_history = deque(maxlen=10)
+    seuil_mouvement = 40 
     seuil_confiance_mots = 0.8
 
-    with vision.HandLandmarker.create_from_options(options) as landmarker:
+    with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
         while cap.isOpened():
             ret, frame = cap.read()
-            if not ret:
-                break
+            if not ret: break
             
             frame = cv.flip(frame, 1)
             h, w = frame.shape[:2]
-            rgb_image = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-
-            result = landmarker.detect(mp_image)
-            keypoints_lstm = np.zeros(126) 
             
-            if result.hand_landmarks:
-                frame = draw_landmarks(frame, result.hand_landmarks)
-
-                # --- 1. Calculs des deux cerveaux en arrière-plan ---
-                # Cerveau Lettres
-                landmark_list = calc_landmark_list(frame, result.hand_landmarks[0])
+            # Préparation de l'image
+            image_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+            image_rgb.flags.writeable = False
+            results = holistic.process(image_rgb)
+            image_rgb.flags.writeable = True
+            
+            lettre_devinee = "..."
+            mot_devine = "..."
+            
+            # --- 1. CERVEAU DES LETTRES (Statique) ---
+            # On cherche s'il y a une main droite, sinon la main gauche
+            main_active = results.right_hand_landmarks if results.right_hand_landmarks else results.left_hand_landmarks
+            
+            if main_active:
+                landmark_list = calc_landmark_list(frame, main_active.landmark)
                 pre_processed_landmark_list = pre_process_landmark(landmark_list)
                 hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
                 lettre_devinee = keypoint_classifier_labels[hand_sign_id]
 
-                # Cerveau Mots
-                all_landmarks = []
-                for hand in result.hand_landmarks:
-                    for lm in hand:
-                        all_landmarks.extend([lm.x, lm.y, lm.z])
-                arr = np.array(all_landmarks)
-                limit = min(len(arr), 126)
-                keypoints_lstm[:limit] = arr[:limit]
-                
-                sequence_lstm.append(keypoints_lstm)
-                sequence_lstm = sequence_lstm[-30:]
-                
-                mot_devine = "..."
-                if len(sequence_lstm) == 30:
-                    res = lstm_model.predict(np.expand_dims(sequence_lstm, axis=0), verbose=0)[0]
-                    if res[np.argmax(res)] > seuil_confiance_mots:
-                        mot_devine = ACTIONS[np.argmax(res)]
+            # --- 2. CERVEAU DES MOTS (Dynamique) ---
+            keypoints_lstm = extraire_points_holistic(results) # 1662 points
+            sequence_lstm.append(keypoints_lstm)
+            sequence_lstm = sequence_lstm[-30:]
+            
+            if len(sequence_lstm) == 30:
+                res = lstm_model.predict(np.expand_dims(sequence_lstm, axis=0), verbose=0)[0]
+                if res[np.argmax(res)] > seuil_confiance_mots:
+                    mot_devine = ACTIONS[np.argmax(res)]
 
-                # --- 2. LE JUGE MATHÉMATIQUE (Vitesse de mouvement) ---
-                # On récupère les coordonnées X, Y du poignet (Landmark 0) en pixels
-                poignet = result.hand_landmarks[0][0]
+            # --- 3. LE JUGE MATHÉMATIQUE (Vitesse de mouvement) ---
+            if main_active:
+                poignet = main_active.landmark[0]
                 wrist_x, wrist_y = int(poignet.x * w), int(poignet.y * h)
                 wrist_history.append((wrist_x, wrist_y))
 
                 if len(wrist_history) == 10:
-                    # On calcule l'écartement maximum du poignet sur les 10 dernières frames
                     dx = max([p[0] for p in wrist_history]) - min([p[0] for p in wrist_history])
                     dy = max([p[1] for p in wrist_history]) - min([p[1] for p in wrist_history])
                     distance_totale = dx + dy
@@ -176,6 +161,15 @@ def main():
                 current_mode = "AUCUNE MAIN"
 
             # --- AFFICHAGE VISUEL ---
+            # Dessin du squelette
+            mp_drawing.draw_landmarks(frame, results.face_landmarks, mp_holistic.FACEMESH_CONTOURS, 
+                                     mp_drawing.DrawingSpec(color=(80,110,10), thickness=1, circle_radius=1),
+                                     mp_drawing.DrawingSpec(color=(80,256,121), thickness=1, circle_radius=1))
+            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
+            mp_drawing.draw_landmarks(frame, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+            mp_drawing.draw_landmarks(frame, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+
+            # Bandeau de texte
             couleur_fond = (0, 100, 0) if "STATIQUE" in current_mode else (0, 0, 150)
             if current_mode == "AUCUNE MAIN": couleur_fond = (50, 50, 50)
 
@@ -187,16 +181,16 @@ def main():
 
             debug_image = frame
 
-
-# --- ROUTES FLASK ---
+# ==========================================
+# 🌐 ROUTES FLASK
+# ==========================================
 app = Flask(__name__)
 CORS(app)
 
 def generate_frames():
     global debug_image
     while True:
-        if debug_image is None:
-            continue 
+        if debug_image is None: continue 
         ret, buffer = cv.imencode('.jpg', debug_image)
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
@@ -206,7 +200,7 @@ def start():
     if process is None or not process.is_alive():
         process = Thread(target=main)
         process.start()
-        return jsonify({"status": "IA Juge démarrée"}), 200
+        return jsonify({"status": "IA démarrée"}), 200
     return jsonify({"status": "IA déjà en cours"}), 400
 
 @app.route('/video_feed')
@@ -217,7 +211,6 @@ def video_feed():
 def sign():
     global process, final_prediction, current_mode
     if process is not None and process.is_alive():
-        # L'API renvoie maintenant une seule prédiction propre avec son contexte !
         return jsonify({
             "prediction": final_prediction,
             "mode": current_mode

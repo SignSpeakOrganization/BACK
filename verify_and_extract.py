@@ -2,79 +2,79 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import os
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
 
 # ==========================================
 # ⚙️ CONFIGURATION
 # ==========================================
-VIDEO_PATH = 'dataset/videos/bonjour.webm'  # Le chemin de ta vidéo à analyser
-MOT_LSF = 'bonjour'      # Le dossier cible
-MODEL_PATH_MP = 'hand_landmarker.task'
+VIDEO_PATH = 'videos/ça va.webm'  # Le chemin de ta vidéo à analyser
+MOT_LSF = 'ça va'                         # Le dossier cible
+
+# Initialisation de MediaPipe Holistic
+mp_holistic = mp.solutions.holistic
+mp_drawing = mp.solutions.drawing_utils
 
 # ==========================================
-# 🛠️ FONCTIONS DE DESSIN ET D'AUGMENTATION
+# 🧠 EXTRACTION & DATA AUGMENTATION (1662 points)
 # ==========================================
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
-    (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15), 
-    (15, 16), (0, 17), (17, 18), (18, 19), (19, 20), (5, 9), (9, 13), (13, 17)
-]
+def extraire_points_holistic(results):
+    # 1. Pose/Corps (33 points * 4 valeurs = 132)
+    pose = np.array([[res.x, res.y, res.z, res.visibility] for res in results.pose_landmarks.landmark]).flatten() if results.pose_landmarks else np.zeros(132)
+    # 2. Visage (468 points * 3 valeurs = 1404)
+    face = np.array([[res.x, res.y, res.z] for res in results.face_landmarks.landmark]).flatten() if results.face_landmarks else np.zeros(1404)
+    # 3. Main Gauche (21 points * 3 valeurs = 63)
+    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(63)
+    # 4. Main Droite (21 points * 3 valeurs = 63)
+    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(63)
+    
+    return np.concatenate([pose, face, lh, rh])
 
-def draw_landmarks(image_bgr, hand_landmarks_list):
-    annotated = image_bgr.copy()
-    h, w = annotated.shape[:2]
-    for hand_landmarks in hand_landmarks_list:
-        pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
-        for a, b in HAND_CONNECTIONS:
-            cv2.line(annotated, pts[a], pts[b], (0, 255, 0), 2)
-        for (x, y) in pts:
-            cv2.circle(annotated, (x, y), 4, (0, 0, 255), -1)
-    return annotated
+def appliquer_transformation(sequence, scale_x=1.0, scale_y=1.0, shift_x=0.0, shift_y=0.0, angle_deg=0.0):
+    seq_trans = sequence.copy()
+    theta = np.radians(angle_deg)
+    c, s = np.cos(theta), np.sin(theta)
+
+    for f in range(len(seq_trans)):
+        if np.all(seq_trans[f] == 0): continue # Ignore les frames vides
+        
+        # Transformation de la Pose (indices 0 à 131, format x, y, z, v)
+        for i in range(0, 132, 4):
+            nx, ny = seq_trans[f, i] - 0.5, seq_trans[f, i+1] - 0.5
+            rx, ry = nx * c - ny * s, nx * s + ny * c
+            seq_trans[f, i] = (rx * scale_x) + 0.5 + shift_x
+            seq_trans[f, i+1] = (ry * scale_y) + 0.5 + shift_y
+
+        # Transformation Visage + Mains (indices 132 à 1661, format x, y, z)
+        for i in range(132, 1662, 3):
+            if seq_trans[f, i] == 0 and seq_trans[f, i+1] == 0: continue
+            nx, ny = seq_trans[f, i] - 0.5, seq_trans[f, i+1] - 0.5
+            rx, ry = nx * c - ny * s, nx * s + ny * c
+            seq_trans[f, i] = (rx * scale_x) + 0.5 + shift_x
+            seq_trans[f, i+1] = (ry * scale_y) + 0.5 + shift_y
+
+    return seq_trans
 
 def generer_variations(sequence_de_base):
     variations = []
     variations.append(sequence_de_base.copy()) # 1. Originale
     
-    seq_3d = sequence_de_base.reshape((30, 42, 3))
-    
     # 2. BRUIT (Tremblement)
-    bruit = np.random.normal(0, 0.005, seq_3d.shape)
-    variations.append((seq_3d + bruit).reshape((30, 126)))
+    bruit = np.random.normal(0, 0.003, sequence_de_base.shape)
+    seq_bruitee = sequence_de_base + bruit
+    seq_bruitee[sequence_de_base == 0] = 0 # Protection des zéros
+    variations.append(seq_bruitee)
     
-    # 3. ZOOM IN
-    seq_zoom_in = seq_3d.copy()
-    seq_zoom_in[:, :, :2] = (seq_zoom_in[:, :, :2] - 0.5) * 1.20 + 0.5 
-    variations.append(seq_zoom_in.reshape((30, 126)))
+    # Utilisation de notre fonction mathématique pour les autres
+    variations.append(appliquer_transformation(sequence_de_base, scale_x=1.2, scale_y=1.2)) # 3. Zoom In
+    variations.append(appliquer_transformation(sequence_de_base, scale_x=0.85, scale_y=0.85)) # 4. Zoom Out
+    variations.append(appliquer_transformation(sequence_de_base, shift_x=0.06, shift_y=-0.04)) # 5. Décalage
+    variations.append(appliquer_transformation(sequence_de_base, angle_deg=10)) # 6. Rotation
+    variations.append(appliquer_transformation(sequence_de_base, scale_x=1.3, scale_y=1.0)) # 7. Stretch Horizontal
     
-    # 4. ZOOM OUT
-    seq_zoom_out = seq_3d.copy()
-    seq_zoom_out[:, :, :2] = (seq_zoom_out[:, :, :2] - 0.5) * 0.85 + 0.5 
-    variations.append(seq_zoom_out.reshape((30, 126)))
-    
-    # 5. DÉCALAGE
-    seq_decalee = seq_3d.copy()
-    seq_decalee[:, :, 0] += 0.06 # Décalage droite
-    seq_decalee[:, :, 1] -= 0.04 # Décalage haut
-    variations.append(seq_decalee.reshape((30, 126)))
-    
-    for var in variations:
-        var[sequence_de_base == 0] = 0 # Protection contre les zéros
-        
     return variations
 
 # ==========================================
 # 🚀 LECTURE ET VÉRIFICATION VISUELLE
 # ==========================================
-base_options = python.BaseOptions(model_asset_path=MODEL_PATH_MP)
-options = vision.HandLandmarkerOptions(
-    base_options=base_options,
-    num_hands=2,
-    min_hand_detection_confidence=0.5,
-    min_hand_presence_confidence=0.5,
-    running_mode=vision.RunningMode.IMAGE
-)
-
 print(f"\n--- Vérification de la vidéo : {VIDEO_PATH} ---")
 sequence = []
 cap = cv2.VideoCapture(VIDEO_PATH)
@@ -82,31 +82,31 @@ cap = cv2.VideoCapture(VIDEO_PATH)
 fps = int(cap.get(cv2.CAP_PROP_FPS))
 delay = int(1000 / fps) if fps > 0 else 30
 
-with vision.HandLandmarker.create_from_options(options) as landmarker:
+with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
 
-        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-
-        result = landmarker.detect(mp_image)
-        keypoints = np.zeros(126)
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image_rgb.flags.writeable = False
+        results = holistic.process(image_rgb)
         
-        if result.hand_landmarks:
-            frame = draw_landmarks(frame, result.hand_landmarks)
-            all_landmarks = []
-            for hand in result.hand_landmarks:
-                for lm in hand:
-                    all_landmarks.extend([lm.x, lm.y, lm.z])
-            arr = np.array(all_landmarks)
-            limit = min(len(arr), 126)
-            keypoints[:limit] = arr[:limit]
-
+        # Extraction
+        keypoints = extraire_points_holistic(results)
         sequence.append(keypoints)
 
-        cv2.putText(frame, "VERIFICATION LANDMARKS", (15, 40), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2, cv2.LINE_AA)
+        # Dessin Visuel
+        image_rgb.flags.writeable = True
+        frame = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+        
+        mp_drawing.draw_landmarks(frame, results.face_landmarks, mp_holistic.FACEMESH_CONTOURS, 
+                                 mp_drawing.DrawingSpec(color=(80,110,10), thickness=1, circle_radius=1),
+                                 mp_drawing.DrawingSpec(color=(80,256,121), thickness=1, circle_radius=1))
+        mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
+        mp_drawing.draw_landmarks(frame, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+        mp_drawing.draw_landmarks(frame, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+
+        cv2.putText(frame, "VERIFICATION HOLISTIC", (15, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.imshow('Verification Video', frame)
 
         if cv2.waitKey(delay) & 0xFF == 27: break
@@ -118,33 +118,31 @@ cv2.destroyAllWindows()
 # 💾 PRISE DE DÉCISION ET AUGMENTATION
 # ==========================================
 print("\n" + "="*50)
-reponse = input("▶ Les landmarks étaient-ils bien placés ? Taper 'o' pour OUI (sauvegarder les 5 variations), 'n' pour NON : ")
+reponse = input("▶ Les landmarks étaient-ils bien placés ? Taper 'o' pour OUI (sauvegarder 7 variations), 'n' pour NON : ")
 
 if reponse.lower() == 'o':
     os.makedirs(os.path.join('dataset', MOT_LSF), exist_ok=True)
     compteur_actuel = len(os.listdir(os.path.join('dataset', MOT_LSF)))
     
-    # Formatage à 30 images
     if len(sequence) >= 30:
         milieu = len(sequence) // 2
         sequence_base = sequence[milieu - 15 : milieu + 15]
     else:
-        sequence_base = sequence + [np.zeros(126)] * (30 - len(sequence))
+        sequence_base = sequence + [np.zeros(1662)] * (30 - len(sequence))
     
     sequence_base = np.array(sequence_base)
     
     print("\nTransformation mathématique des mouvements en cours...")
-    cinq_variations = generer_variations(sequence_base)
-    noms_variations = ["Originale", "Bruitée (Tremblement)", "Zoom In", "Zoom Out", "Décalée"]
+    sept_variations = generer_variations(sequence_base)
+    noms_variations = ["Originale", "Bruitée (Tremblement)", "Zoom In", "Zoom Out", "Décalée", "Rotation", "Étirement X"]
 
     print(f"\n✅ Génération des fichiers à partir de l'index {compteur_actuel} :")
-    for i, seq_aug in enumerate(cinq_variations):
+    for i, seq_aug in enumerate(sept_variations):
         nom_fichier = f"{compteur_actuel}.npy"
-        chemin = os.path.join('dataset', MOT_LSF, nom_fichier)
-        np.save(chemin, seq_aug)
+        np.save(os.path.join('dataset', MOT_LSF, nom_fichier), seq_aug)
         print(f"  - Création de {nom_fichier} (Version : {noms_variations[i]})")
         compteur_actuel += 1
 
     print(f"\n🎉 Terminé ! Ton dossier '{MOT_LSF}' contient maintenant {compteur_actuel} fichiers.")
 else:
-    print("❌ Sauvegarde annulée. Le dataset n'a pas été modifié.")
+    print("❌ Sauvegarde annulée.")
