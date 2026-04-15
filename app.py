@@ -9,6 +9,8 @@ import mediapipe as mp
 import copy
 import itertools
 import csv
+import time
+import requests
 from collections import deque
 from tensorflow.keras.models import load_model
 
@@ -23,8 +25,22 @@ from model import KeyPointClassifier
 cap = None
 debug_image = None
 final_prediction = "..."  
-current_mode = "..."      
+current_mode = "..."     
+current_confidence = 0.0
+last_speech_text = ""
+last_speech_error = None
+
+# pour import time 
+current_phrase = []
+last_added_word = None
+last_added_time = 0
+
+ 
 process = None
+camera_running = False
+camera_index = None
+last_error = None
+last_frame_ok = False
 
 # --- MEDIAPIPE HOLISTIC ---
 mp_holistic = mp.solutions.holistic
@@ -88,23 +104,107 @@ def pre_process_landmark(landmark_list):
         return n / max_value if max_value > 0 else 0
     return list(map(normalize_, temp_landmark_list))
 
+ 
+def add_word_to_phrase(word):
+    global current_phrase, last_added_word, last_added_time
+
+    if word is None or word.strip() == "" or word == "..." or word == "analyse ...":
+        return
+
+    now = time.time()
+
+    if word == last_added_word and (now - last_added_time) < 1.5:
+        return
+
+    current_phrase.append(word)
+    last_added_word = word
+    last_added_time = now
+    
+def call_stt_api(audio_path, lang="fr"):
+    global last_speech_error
+
+    url = "http://127.0.0.1:5010/stt"
+
+    try:
+        with open(audio_path, "rb") as audio_file:
+            files = {
+                "audio": audio_file
+            }
+            data = {
+                "lang": lang
+            }
+
+            response = requests.post(url, files=files, data=data, timeout=120)
+            
+            try:
+                result = response.json()
+            except Exception:
+                result = {
+                    "status": "error",
+                    "error": response.text
+                }
+
+            if response.status_code >= 400:
+                last_speech_error = result.get("error", f"HTTP {response.status_code}")
+                return result
+
+            last_speech_error = None
+            return result
+
+    except Exception as e:
+        last_speech_error = str(e)
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+ 
 # ==========================================
 # 🚀 BOUCLE PRINCIPALE (IA)
 # ==========================================
 def main():
     global cap, debug_image, final_prediction, current_mode
+    global current_confidence, camera_running, camera_index
+    global last_error, last_frame_ok
+    
     print("Lancement de l'analyse avec le Juge Mathématique (Holistic)...")
+    camera_running = True
+    last_error = None
+    last_frame_ok = False
 
-    cap = cv.VideoCapture(1) # 1 pour Mac, 0 pour iPhone
+    cap = None
+    for idx in [0, 1, 2]:
+        print(f"[DEBUG] Test caméra index {idx}")
+        test_cap = cv.VideoCapture(idx, cv.CAP_AVFOUNDATION)
+        if test_cap.isOpened():
+            ret, frame = test_cap.read()
+            if ret and frame is not None:
+                cap = test_cap
+                camera_index = idx
+                print(f"[OK] Caméra ouverte sur index {idx}")
+                break
+            test_cap.release()
+
+    if cap is None:
+        last_error = "Impossible d'ouvrir une caméra valide"
+        print(f"[ERROR] {last_error}")
+        camera_running = False
+        return
+    
     sequence_lstm = []
     wrist_history = deque(maxlen=10)
     seuil_mouvement = 40 
     seuil_confiance_mots = 0.8
 
     with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
-        while cap.isOpened():
+        while camera_running and cap is not None and cap.isOpened():
             ret, frame = cap.read()
-            if not ret: break
+            if not ret or frame is None:
+                last_frame_ok = False
+                last_error = "Lecture frame échouée"
+                print("[Error] Impossible de lire une frame")
+                continue
+            last_frame_ok = True
+            last_error = None
             
             frame = cv.flip(frame, 1)
             h, w = frame.shape[:2]
@@ -151,10 +251,12 @@ def main():
 
                     if distance_totale > seuil_mouvement:
                         current_mode = "DYNAMIQUE (Mot)"
-                        final_prediction = mot_devine
+                        final_prediction = mot_devine if mot_devine != "..." else "analyse ..."
+                        add_word_to_phrase(final_prediction)
                     else:
                         current_mode = "STATIQUE (Lettre)"
-                        final_prediction = lettre_devinee
+                        final_prediction = lettre_devinee if lettre_devinee != "..." else "analyse ..."
+                        
             else:
                 wrist_history.clear()
                 final_prediction = "..."
@@ -180,6 +282,13 @@ def main():
                        cv.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv.LINE_AA)
 
             debug_image = frame
+            
+    if cap is not None:
+         cap.release()
+         cap = None
+
+    camera_running = False
+    print("[DEBUG] Fin du thread caméra")
 
 # ==========================================
 # 🌐 ROUTES FLASK
@@ -196,34 +305,173 @@ def generate_frames():
 
 @app.route('/start', methods=['GET'])
 def start():
-    global process
-    if process is None or not process.is_alive():
-        process = Thread(target=main)
-        process.start()
-        return jsonify({"status": "IA démarrée"}), 200
-    return jsonify({"status": "IA déjà en cours"}), 400
+    global process, camera_running
+    
+    if process is not None and process.is_alive():
+        return jsonify({
+            "status": "IA déjà en cours",
+            "camera_running": camera_running
+        }), 200
+    process = Thread(target=main, daemon=True)
+    process.start()
+
+    return jsonify({
+        "status": "IA démarrée",
+        "camera_running": True
+    }), 200
 
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+@app.route('/conversation/state', methods=['GET'])
+def conversation_state():
+    global process, camera_running, camera_index
+    global final_prediction, current_mode, current_confidence
+    global last_frame_ok, last_error, current_phrase
+    global last_speech_text, last_speech_error
+
+    return jsonify({
+        "success": True,
+        "thread_alive": process.is_alive() if process is not None else False,
+        "camera_running": camera_running,
+        "camera_index": camera_index,
+        "frame_ok": last_frame_ok,
+        "prediction": final_prediction,
+        "mode": current_mode,
+        "confidence": current_confidence,
+        "phrase": current_phrase,
+        "text": " ".join(current_phrase),
+        "error": last_error,
+        "speech_text": last_speech_text,
+        "speech_error": last_speech_error,
+        "timestamp": time.time()
+    }), 200
+
 @app.route('/sign', methods=['GET'])
 def sign():
     global process, final_prediction, current_mode
+    global current_confidence, camera_running, last_frame_ok, last_error
+
     if process is not None and process.is_alive():
         return jsonify({
+            "success": True,
             "prediction": final_prediction,
-            "mode": current_mode
+            "mode": current_mode,
+            "confidence": current_confidence,
+            "camera_running": camera_running,
+            "frame_ok": last_frame_ok,
+            "error": last_error,
+            "timestamp": time.time()
         }), 200
-    return jsonify({"status": "Caméra non démarrée"}), 400
+
+    return jsonify({
+        "success": False,
+        "prediction": "",
+        "mode": "",
+        "confidence": 0.0,
+        "camera_running": False,
+        "frame_ok": False,
+        "error": "Caméra non démarrée",
+        "timestamp": time.time()
+    }), 400
+    
+@app.route('/phrase', methods=['GET'])
+def phrase():
+    global current_phrase
+    return jsonify({
+        "phrase": current_phrase,
+        "text": " ".join(current_phrase)
+    }), 200
+    
+@app.route('/clear_phrase', methods=['POST', 'GET'])
+def clear_phrase():
+    global current_phrase, last_added_word, last_added_time
+
+    current_phrase = []
+    last_added_word = None
+    last_added_time = 0
+
+    return jsonify({
+        "status": "Phrase effacée",
+        "phrase": current_phrase,
+        "text": ""
+    }), 200
 
 @app.route('/end', methods=['GET'])
 def end():
-    global cap
-    if cap:
-        cap.release()
-        cv.destroyAllWindows()
-    return jsonify({"status": "Caméra coupée"}), 200
+    global cap, camera_running, process
 
+    camera_running = False
+
+    if cap is not None:
+        cap.release()
+        cap = None
+
+    cv.destroyAllWindows()
+
+    return jsonify({
+        "status": "Caméra coupée",
+        "camera_running": False
+    }), 200
+    
+@app.route('/status', methods=['GET'])
+def status():
+    global process, camera_running, camera_index
+    global final_prediction, current_mode, current_confidence
+    global last_frame_ok, last_error
+
+    return jsonify({
+        "success": True,
+        "thread_alive": process.is_alive() if process is not None else False,
+        "camera_running": camera_running,
+        "camera_index": camera_index,
+        "frame_ok": last_frame_ok,
+        "prediction": final_prediction,
+        "mode": current_mode,
+        "confidence": current_confidence,
+        "phrase_length": len(current_phrase),
+        "text": " ".join(current_phrase),
+        "error": last_error,
+        "timestamp": time.time()
+    }), 200
+    
+@app.route('/speech/test', methods=['GET'])
+def speech_test():
+    global last_speech_text, last_speech_error
+
+    test_audio_path = "test.wav"
+
+    result = call_stt_api(test_audio_path, lang="fr")
+
+    if result.get("status") == "ok":
+        last_speech_text = result.get("text", "")
+        return jsonify({
+            "success": True,
+            "speech_text": last_speech_text,
+            "language": result.get("language"),
+            "segments": result.get("segments", []),
+            "error": None
+        }), 200
+
+    return jsonify({
+        "success": False,
+        "speech_text": last_speech_text,
+        "error": result.get("error", "Erreur STT inconnue"),
+        "speech_error": last_speech_error
+    }), 500
+
+
+# ROUTE À VÉRIFIER QUE LE SERVEUR EST EN LIGNE
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "success": True,
+        "service": "SignSpeak BACK",
+        "status": "ok",
+        "timestamp": time.time()
+    }), 200
+    
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(host="127.0.0.1", port=8000, debug=True, threaded=True, use_reloader=False)
