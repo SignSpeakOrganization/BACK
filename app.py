@@ -3,6 +3,10 @@
 import os
 os.environ["OPENCV_AVFOUNDATION_SKIP_AUTH"] = "1"
 
+# --- CHARGEMENT DU .env ---
+from dotenv import load_dotenv
+load_dotenv()
+
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
@@ -12,11 +16,11 @@ import csv
 import time
 import requests
 from collections import deque
+from threading import Thread, Event, Lock
 from tensorflow.keras.models import load_model
 
 from flask import Flask, Response, jsonify
 from flask_cors import CORS
-from threading import Thread
 
 # --- IMPORTS DE TES ANCIENS MODÈLES (LETTRES) ---
 from model import KeyPointClassifier
@@ -37,10 +41,15 @@ last_added_time = 0
 
  
 process = None
-camera_running = False
-camera_index = None
-last_error = None
-last_frame_ok = False
+stop_event = Event()       # Signal d'arrêt propre pour le thread
+frame_lock = Lock()        # Protège debug_image contre les race conditions
+
+# --- CONFIG CAMÉRA DEPUIS .env ---
+CAMERA_INDEX  = int(os.getenv("CAMERA_DEVICE", 1))
+CAMERA_WIDTH  = int(os.getenv("CAMERA_WIDTH", 960))
+CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", 540))
+MIN_DETECTION = float(os.getenv("MIN_DETECTION_CONFIDENCE", 0.5))
+MIN_TRACKING  = float(os.getenv("MIN_TRACKING_CONFIDENCE", 0.5))
 
 # --- MEDIAPIPE HOLISTIC ---
 mp_holistic = mp.solutions.holistic
@@ -62,8 +71,15 @@ print(f"✅ Mots dynamiques détectés dans le dataset : {ACTIONS}")
 try:
     lstm_model = load_model('modele_lsf.keras')
     print("✅ Modèle LSTM (Mots) chargé avec succès !")
+    # Vérification de cohérence modèle / dataset
+    n_classes_model = lstm_model.output_shape[-1]
+    if n_classes_model != len(ACTIONS):
+        print(f"⚠️  ATTENTION : Le modèle a été entraîné avec {n_classes_model} classes "
+              f"mais le dataset en contient {len(ACTIONS)}. "
+              f"Réentraîne le modèle pour éviter des erreurs d'index.")
 except Exception as e:
     print(f"❌ Erreur chargement LSTM : {e}")
+    lstm_model = None
 
 # --- CONFIGURATION IA (LETTRES STATIQUES) ---
 keypoint_classifier = KeyPointClassifier()
@@ -167,36 +183,20 @@ def main():
     global last_error, last_frame_ok
     
     print("Lancement de l'analyse avec le Juge Mathématique (Holistic)...")
-    camera_running = True
-    last_error = None
-    last_frame_ok = False
+    stop_event.clear()
 
-    cap = None
-    for idx in [0, 1, 2]:
-        print(f"[DEBUG] Test caméra index {idx}")
-        test_cap = cv.VideoCapture(idx, cv.CAP_AVFOUNDATION)
-        if test_cap.isOpened():
-            ret, frame = test_cap.read()
-            if ret and frame is not None:
-                cap = test_cap
-                camera_index = idx
-                print(f"[OK] Caméra ouverte sur index {idx}")
-                break
-            test_cap.release()
+    cap = cv.VideoCapture(CAMERA_INDEX)
+    cap.set(cv.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
 
-    if cap is None:
-        last_error = "Impossible d'ouvrir une caméra valide"
-        print(f"[ERROR] {last_error}")
-        camera_running = False
-        return
-    
     sequence_lstm = []
     wrist_history = deque(maxlen=10)
-    seuil_mouvement = 40 
+    # Seuil adaptatif : ~6% de la largeur de l'image (indépendant de la résolution)
+    seuil_mouvement = int(0.06 * CAMERA_WIDTH)
     seuil_confiance_mots = 0.8
 
-    with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
-        while camera_running and cap is not None and cap.isOpened():
+    with mp_holistic.Holistic(min_detection_confidence=MIN_DETECTION, min_tracking_confidence=MIN_TRACKING) as holistic:
+        while cap.isOpened() and not stop_event.is_set():
             ret, frame = cap.read()
             if not ret or frame is None:
                 last_frame_ok = False
@@ -233,7 +233,7 @@ def main():
             sequence_lstm.append(keypoints_lstm)
             sequence_lstm = sequence_lstm[-30:]
             
-            if len(sequence_lstm) == 30:
+            if len(sequence_lstm) == 30 and lstm_model is not None:
                 res = lstm_model.predict(np.expand_dims(sequence_lstm, axis=0), verbose=0)[0]
                 if res[np.argmax(res)] > seuil_confiance_mots:
                     mot_devine = ACTIONS[np.argmax(res)]
@@ -281,14 +281,8 @@ def main():
             cv.putText(frame, f"Signe : {final_prediction}", (15, 55), 
                        cv.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv.LINE_AA)
 
-            debug_image = frame
-            
-    if cap is not None:
-         cap.release()
-         cap = None
-
-    camera_running = False
-    print("[DEBUG] Fin du thread caméra")
+            with frame_lock:
+                debug_image = frame.copy()
 
 # ==========================================
 # 🌐 ROUTES FLASK
@@ -299,26 +293,36 @@ CORS(app)
 def generate_frames():
     global debug_image
     while True:
-        if debug_image is None: continue 
-        ret, buffer = cv.imencode('.jpg', debug_image)
+        with frame_lock:
+            if debug_image is None:
+                continue
+            frame_copy = debug_image.copy()
+        ret, buffer = cv.imencode('.jpg', frame_copy)
+        if not ret:
+            continue
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({
+        "status": "API LSF active",
+        "dataset": list(ACTIONS),
+        "endpoints": {
+            "GET /start":      "Allume la caméra et lance la détection",
+            "GET /sign":       "Retourne la prédiction courante (JSON)",
+            "GET /video_feed": "Flux MJPEG de la caméra avec squelette",
+            "GET /end":        "Coupe la caméra et arrête le thread"
+        }
+    }), 200
 
 @app.route('/start', methods=['GET'])
 def start():
-    global process, camera_running
-    
-    if process is not None and process.is_alive():
-        return jsonify({
-            "status": "IA déjà en cours",
-            "camera_running": camera_running
-        }), 200
-    process = Thread(target=main, daemon=True)
-    process.start()
-
-    return jsonify({
-        "status": "IA démarrée",
-        "camera_running": True
-    }), 200
+    global process
+    if process is None or not process.is_alive():
+        process = Thread(target=main, daemon=True)
+        process.start()
+        return jsonify({"status": "IA démarrée"}), 200
+    return jsonify({"status": "IA déjà en cours"}), 400
 
 @app.route('/video_feed')
 def video_feed():
@@ -400,78 +404,20 @@ def clear_phrase():
 
 @app.route('/end', methods=['GET'])
 def end():
-    global cap, camera_running, process
-
-    camera_running = False
-
+    global cap, process
+    stop_event.set()           # Demande l'arrêt propre du thread
+    if process is not None:
+        process.join(timeout=3)  # Attend max 3s que le thread se termine
     if cap is not None:
         cap.release()
         cap = None
-
     cv.destroyAllWindows()
+    return jsonify({"status": "Caméra coupée"}), 200
 
-    return jsonify({
-        "status": "Caméra coupée",
-        "camera_running": False
-    }), 200
-    
-@app.route('/status', methods=['GET'])
-def status():
-    global process, camera_running, camera_index
-    global final_prediction, current_mode, current_confidence
-    global last_frame_ok, last_error
-
-    return jsonify({
-        "success": True,
-        "thread_alive": process.is_alive() if process is not None else False,
-        "camera_running": camera_running,
-        "camera_index": camera_index,
-        "frame_ok": last_frame_ok,
-        "prediction": final_prediction,
-        "mode": current_mode,
-        "confidence": current_confidence,
-        "phrase_length": len(current_phrase),
-        "text": " ".join(current_phrase),
-        "error": last_error,
-        "timestamp": time.time()
-    }), 200
-    
-@app.route('/speech/test', methods=['GET'])
-def speech_test():
-    global last_speech_text, last_speech_error
-
-    test_audio_path = "test.wav"
-
-    result = call_stt_api(test_audio_path, lang="fr")
-
-    if result.get("status") == "ok":
-        last_speech_text = result.get("text", "")
-        return jsonify({
-            "success": True,
-            "speech_text": last_speech_text,
-            "language": result.get("language"),
-            "segments": result.get("segments", []),
-            "error": None
-        }), 200
-
-    return jsonify({
-        "success": False,
-        "speech_text": last_speech_text,
-        "error": result.get("error", "Erreur STT inconnue"),
-        "speech_error": last_speech_error
-    }), 500
-
-
-# ROUTE À VÉRIFIER QUE LE SERVEUR EST EN LIGNE
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({
-        "success": True,
-        "service": "SignSpeak BACK",
-        "status": "ok",
-        "timestamp": time.time()
-    }), 200
-    
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8000, debug=True, threaded=True, use_reloader=False)
+    flask_host  = os.getenv("FLASK_HOST",  "0.0.0.0")
+    flask_port  = int(os.getenv("FLASK_PORT", 5000))
+    flask_debug = os.getenv("FLASK_DEBUG", "0") == "1"
+    # use_reloader=False : indispensable quand on utilise des Threads,
+    # le reloader démarrerait 2 processus et causerait un conflit sur la caméra.
+    app.run(host=flask_host, port=flask_port, debug=flask_debug, use_reloader=False)
