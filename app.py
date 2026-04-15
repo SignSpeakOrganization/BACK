@@ -13,6 +13,7 @@ import itertools
 import time
 from collections import deque
 from threading import Thread, Event, Lock
+import json
 
 import cv2 as cv
 import mediapipe as mp
@@ -54,6 +55,7 @@ camera_index = None
 last_error = None
 last_frame_ok = False
 
+HISTORY_FILE = "conversation_history.json"
 
 # ==========================================
 # CONFIG
@@ -188,12 +190,47 @@ def add_to_history(source, text):
         return
 
     message_counter += 1
+
     conversation_history.append({
         "id": message_counter,
         "timestamp": time.time(),
         "source": source,
         "text": text
     })
+
+    save_history()
+    
+def load_history():
+    global conversation_history, message_counter
+
+    if not os.path.exists(HISTORY_FILE):
+        conversation_history = []
+        message_counter = 0
+        return
+
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            conversation_history = json.load(f)
+
+        if conversation_history:
+            message_counter = max(item.get("id", 0) for item in conversation_history)
+        else:
+            message_counter = 0
+
+        print(f"✅ Historique chargé : {len(conversation_history)} messages")
+
+    except Exception as e:
+        print(f"❌ Erreur chargement historique : {e}")
+        conversation_history = []
+        message_counter = 0
+
+
+def save_history():
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(conversation_history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"❌ Erreur sauvegarde historique : {e}")
 
 
 def add_word_to_phrase(word):
@@ -602,6 +639,7 @@ def clear_conversation_history():
 
     conversation_history = []
     message_counter = 0
+    save_history()
 
     return jsonify({
         "success": True,
@@ -672,5 +710,7 @@ def end():
 # ==========================================
 # MAIN
 # ==========================================
+load_history()
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8000, debug=False, threaded=True, use_reloader=False)
