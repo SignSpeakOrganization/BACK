@@ -19,7 +19,7 @@ import cv2 as cv
 import mediapipe as mp
 import numpy as np
 import requests
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, request,  jsonify
 from flask_cors import CORS
 from tensorflow.keras.models import load_model
 
@@ -66,7 +66,7 @@ CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", 540))
 MIN_DETECTION = float(os.getenv("MIN_DETECTION_CONFIDENCE", 0.5))
 MIN_TRACKING = float(os.getenv("MIN_TRACKING_CONFIDENCE", 0.5))
 STT_URL = os.getenv("STT_URL", "http://127.0.0.1:5010/stt")
-
+STT_SERVER_URL = "http://127.0.0.1:5010/stt"
 
 # ==========================================
 # FLASK
@@ -485,7 +485,10 @@ def index():
             "GET /status": "Etat caméra et thread",
             "GET /sign": "Retourne la prédiction courante",
             "GET /phrase": "Retourne la phrase courante",
+            "GET /clear_phrase": "supprimer la phrase courante",
             "GET /speech/test": "Teste la transcription vocale",
+            "GET /conversation/history" : "Stocker les conversations ",
+            "GET /conversation/history/clear" : "Supprimer le stockage des conversations ",
             "GET /conversation/state": "Etat global",
             "GET /video_feed": "Flux vidéo MJPEG",
             "GET /end": "Coupe la caméra"
@@ -705,6 +708,60 @@ def end():
         "status": "Caméra coupée",
         "camera_running": False
     }), 200
+    
+# le route qui reçoit un fichier audio depuis le frontend
+    
+@app.route("/speech/transcribe", methods=["POST"])
+def speech_transcribe():
+    if "audio" not in request.files:
+        return jsonify({
+            "success": False,
+            "error": "Aucun fichier audio reçu"
+        }), 400
+
+    audio_file = request.files["audio"]
+    lang = request.form.get("lang", "fr")
+
+    try:
+        files = {
+            "audio": (
+                audio_file.filename or "audio.webm",
+                audio_file.stream,
+                audio_file.mimetype or "audio/webm"
+            )
+        }
+
+        data = {
+            "lang": lang
+        }
+
+        response = requests.post(STT_SERVER_URL, files=files, data=data)
+
+        if response.status_code != 200:
+            return jsonify({
+                "success": False,
+                "error": "Erreur serveur STT",
+                "details": response.text
+            }), 500
+
+        stt_data = response.json()
+        text = stt_data.get("text", "").strip()
+
+        if text:
+            add_to_history("speech", text)
+
+        return jsonify({
+            "success": True,
+            "source": "speech",
+            "text": text,
+            "stt": stt_data
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
 # ==========================================

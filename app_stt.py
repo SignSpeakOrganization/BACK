@@ -103,11 +103,6 @@ def health():
 
 @app.route("/stt", methods=["POST"])
 def stt():
-    """
-    POST multipart/form-data
-      - audio: fichier audio (webm/wav/m4a/mp3...)
-      - lang: optionnel ("fr" par défaut)
-    """
     if "audio" not in request.files:
         return jsonify({
             "status": "error",
@@ -118,16 +113,16 @@ def stt():
     lang = request.form.get("lang", "fr")
 
     uid = uuid.uuid4().hex
-    in_path = TMP_DIR / f"{uid}_{audio_file.filename}"
+    filename = audio_file.filename or "audio.webm"
+
+    in_path = TMP_DIR / f"{uid}_{filename}"
     wav_path = TMP_DIR / f"{uid}.wav"
 
     try:
         audio_file.save(str(in_path))
 
-        # Conversion vers wav 16k mono
         ffmpeg_to_wav16k_mono(in_path, wav_path)
 
-        # Transcription
         result = transcribe_whisper(wav_path, language=lang)
 
         return jsonify({
@@ -144,18 +139,13 @@ def stt():
         }), 500
 
     finally:
-        try:
-            if in_path.exists():
-                in_path.unlink()
-        except Exception:
-            pass
-
-        try:
-            if wav_path.exists():
-                wav_path.unlink()
-        except Exception:
-            pass
-
-
+        for path in [in_path, wav_path]:
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+            
+            
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=APP_PORT, debug=True, use_reloader=False)
